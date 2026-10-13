@@ -1,0 +1,37 @@
+__pycache__/
+*.py[cod]
+.DS_Store
+
+# Local account data and future exports must not be published.
+/reports/
+/exports/
+/credentials/
+/auth_state/
+/sessions/
+/logs/
+/tmp/
+
+# Raw review events contain local paths and tool/session metadata.
+/docs/reviews/evidence/
+
+# Secrets and local databases, including files placed outside the usual folders.
+.env
+.env.*
+*token*.json
+*credentials*.json
+*.pem
+*.key
+*.p12
+*.pfx
+*.keychain-db
+*.sqlite
+*.sqlite3
+*.sqlite-wal
+*.sqlite-shm
+*.db
+*.db-wal
+*.db-shm
+*.log
+
+# Local Python environment.
+/.venv/
