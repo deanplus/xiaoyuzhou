@@ -1,18 +1,17 @@
 #!/usr/bin/env python3
-"""User-approved one-shot QR authentication, then bounded read-only probe.
+"""QR login, reusable local session and bounded read probe.
 
 Public sources: accounts.xiaoyuzhoufm.com/assets/index-CqItVqUi.js,
 github.com/jerryqx/dsh-xiaoyuzhou/blob/main/lib/xyzfm.js,
 github.com/HuangYincan/VideoNote-MCP/blob/main/videonote_mcp/cli.py.
 This is an unofficial client of the first-party web login, not a registered OAuth app.
-No existing credentials are read, no refresh token retained, no credentials saved.
+One-shot mode never reads or saves credentials; persistent modes are explicit.
 """
 import argparse
-from http.cookies import SimpleCookie, CookieError
+from contextlib import nullcontext
 import json
 import os
 from pathlib import Path
-import resource
 import signal
 import sys
 import tempfile
@@ -26,6 +25,7 @@ import qrcode
 from qrcode.image.pure import PyPNGImage
 
 import xyz_probe as p
+import xyz_auth as auth
 
 WEB = "https://web-api.xiaoyuzhoufm.com"
 MAX_POLLS = 120
@@ -51,27 +51,18 @@ def checked_qr_payload(value):
 
 
 def access_from_headers(headers):
-    token = headers.get("x-jike-access-token")
-    if not token:
-        # Only this new login response is inspected; never read browser storage.
-        for value in headers.get_all("Set-Cookie", []):
-            cookie = SimpleCookie()
-            try:
-                cookie.load(value)
-            except CookieError:
-                continue
-            if "x-jike-access-token" in cookie:
-                token = cookie["x-jike-access-token"].value
-                break
-    if not isinstance(token, str) or not 1 <= len(token) <= 8192 or any(ord(c) < 33 or ord(c) > 126 for c in token):
-        raise p.Stop("qr_confirmed_without_usable_access_token")
-    return token
+    try:
+        token = auth.response_token(headers, "x-jike-access-token")
+        return auth.checked_token(token)
+    except p.Stop:
+        raise p.Stop("qr_confirmed_without_usable_access_token") from None
 
 
 class QrLogin:
-    def __init__(self):
+    def __init__(self, retain_refresh=False):
         self.opener = urllib.request.build_opener(urllib.request.ProxyHandler({}), p.NoRedirect())
         self.requests = 0
+        self.retain_refresh = retain_refresh
 
     def post(self, path, body):
         if path not in {"/v1/auth/qrcode/create", "/v1/auth/qrcode/login"}:
@@ -94,7 +85,8 @@ class QrLogin:
                 except (ValueError, UnicodeError):
                     raise p.Stop("qr_non_json") from None
                 if path.endswith("/login") and isinstance(data, dict) and data.get("status") in {"CONFIRMED", "USED"}:
-                    return data, access_from_headers(res.headers)
+                    tokens = auth.response_pair(res.headers, data) if self.retain_refresh else access_from_headers(res.headers)
+                    return data, tokens
                 return data, None
         except urllib.error.HTTPError as exc:
             status = exc.code
@@ -103,7 +95,7 @@ class QrLogin:
             except Exception:
                 error = {"server_code": None}
             finally:
-                exc.close()
+                p.close_http_error(exc)
             if status == 401 and error.get("server_code") == 21:
                 raise p.Stop("qr_expired") from None
             raise p.Stop("qr_http_" + str(status)) from None
@@ -114,8 +106,10 @@ class QrLogin:
 def render_qr(url, path):
     # Local PNG generation: no URL in argv, external services or logs.
     try:
+        auth.protect_path(path.parent, directory=True)
         image = qrcode.make(url, image_factory=PyPNGImage, box_size=8, border=4)
         with os.fdopen(os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600), "wb") as output:
+            auth.protect_path(path)
             image.save(output)
     except Exception:
         raise p.Stop("qr_render_failed") from None
@@ -137,50 +131,81 @@ def interrupt_for_cleanup(signum, frame):
     raise KeyboardInterrupt
 
 
+def login_and_probe(login, client, report, saved_session=None):
+    with tempfile.TemporaryDirectory(prefix="xyz-login-qr-") as tmp:
+        qr_path = Path(tmp) / "login.png"
+        payload, _ = login.post("/v1/auth/qrcode/create", {"clientId": "xyz-web"})
+        qr_id, qr_url = checked_qr_payload(payload)
+        render_qr(qr_url, qr_path)
+        del payload, qr_url
+        print("QR_IMAGE=" + str(qr_path), flush=True)
+        print("请用小宇宙 App 扫一扫并确认；最多等候四分钟。", flush=True)
+        deadline = time.monotonic() + 240
+        for _ in range(MAX_POLLS):
+            if time.monotonic() >= deadline:
+                raise p.Stop("qr_timeout")
+            time.sleep(2)
+            data, tokens = login.post("/v1/auth/qrcode/login", {"id": qr_id})
+            status = data.get("status") if isinstance(data, dict) else None
+            if tokens:
+                qr_path.unlink()
+                report["authenticated"] = True
+                if saved_session is not None:
+                    saved_session.save_login(tokens, client.device_id)
+                    saved_session.attach(client)
+                    report["credentials_saved"] = True
+                else:
+                    client.token = tokens
+                del tokens, data, qr_id
+                print("扫码登录已确认，开始读取验证。", flush=True)
+                p.run_probe(client, report)
+                return
+            if status not in {"WAITTING", "SCANNED"}:
+                raise p.Stop("qr_unexpected_status")
+        raise p.Stop("qr_timeout")
+
+
 def main():
-    resource.setrlimit(resource.RLIMIT_CORE, (0, 0))
+    p.disable_core_dumps()
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--approved-one-shot", action="store_true", help="Requires explicit user approval in the calling chat.")
+    modes = parser.add_mutually_exclusive_group()
+    modes.add_argument("--approved-one-shot", action="store_true", help="User-approved QR test; no saved session read or written.")
+    modes.add_argument("--login", action="store_true", help="QR login and save access/refresh tokens in local tmp/auth.")
+    modes.add_argument("--reuse-session", action="store_true", help="Use local session; refresh once on API 401 without QR login.")
+    modes.add_argument("--logout", action="store_true", help="Delete local credentials; does not revoke the server session.")
     args = parser.parse_args()
-    if not args.approved_one_shot:
+    if not any(vars(args).values()):
         parser.print_help()
-        return
-    report = {"started_at": datetime.now(p.CN).isoformat(), "mode": "one_shot_qr_authenticated_probe",
+        return 0
+    if args.logout:
+        try:
+            with auth.SavedSession() as session:
+                session.logout()
+        except p.Stop as exc:
+            print("状态：" + str(exc))
+            return 2
+        print("本地凭据已删除；服务端会话未撤销。")
+        return 0
+    report = {"started_at": datetime.now(p.CN).isoformat(),
+              "mode": "one_shot_qr_authenticated_probe" if args.approved_one_shot else "saved_session_probe",
               "authenticated": False, "credentials_saved": False, "refresh_used": False,
               "audio_played_or_downloaded": False, "mobile_history_sync": "not_verified",
               "local_disposal_does_not_revoke_server_session": True}
-    login, client = QrLogin(), p.Client()
-    handlers = {sig: signal.signal(sig, interrupt_for_cleanup) for sig in (signal.SIGTERM, signal.SIGHUP)}
+    login, client = QrLogin(retain_refresh=args.login), p.Client()
+    cleanup_signals = [getattr(signal, name) for name in ("SIGTERM", "SIGHUP") if hasattr(signal, name)]
+    handlers = {sig: signal.signal(sig, interrupt_for_cleanup) for sig in cleanup_signals}
     try:
-        with tempfile.TemporaryDirectory(prefix="xyz-login-qr-") as tmp:
-            qr_path = Path(tmp) / "login.png"
-            payload, _ = login.post("/v1/auth/qrcode/create", {"clientId": "xyz-web"})
-            qr_id, qr_url = checked_qr_payload(payload)
-            render_qr(qr_url, qr_path)
-            del payload, qr_url
-            print("QR_IMAGE=" + str(qr_path), flush=True)
-            print("请用小宇宙 App 扫一扫并确认；最多等候四分钟。", flush=True)
-            deadline = time.monotonic() + 240
-            for _ in range(MAX_POLLS):
-                if time.monotonic() >= deadline:
-                    raise p.Stop("qr_timeout")
-                time.sleep(2)
-                data, access = login.post("/v1/auth/qrcode/login", {"id": qr_id})
-                status = data.get("status") if isinstance(data, dict) else None
-                if access:
-                    client.token = access
-                    del access, data, qr_id
-                    qr_path.unlink()
-                    report["authenticated"] = True
-                    print("扫码登录已确认，开始只读验证。", flush=True)
-                    p.run_probe(client, report)
-                    report["verification"] = assess_report(report)
-                    report["status"] = "read_paths_verified" if report["verification"]["all_read_paths_verified"] else "partial_reads"
-                    break
-                if status not in {"WAITTING", "SCANNED"}:
-                    raise p.Stop("qr_unexpected_status")
+        context = nullcontext() if args.approved_one_shot else auth.SavedSession()
+        with context as session:
+            if args.reuse_session:
+                session.load(client)
+                report["authenticated"] = True
+                report["credentials_saved"] = True
+                p.run_probe(client, report)
             else:
-                raise p.Stop("qr_timeout")
+                login_and_probe(login, client, report, session)
+            report["verification"] = assess_report(report)
+            report["status"] = "read_paths_verified" if report["verification"]["all_read_paths_verified"] else "partial_reads"
     except p.Stop as exc:
         report["status"] = str(exc)
     except (KeyboardInterrupt, EOFError):
@@ -189,7 +214,11 @@ def main():
         report["status"] = "unexpected_error_details_suppressed"
     finally:
         report["qr_request_count"] = login.requests
-        report["read_request_count"] = client.requests
+        report["read_request_count"] = client.requests - client.refresh_requests
+        report["refresh_request_count"] = client.refresh_requests
+        report["refresh_used"] = client.refresh_requests > 0
+        report["refresh_succeeded"] = client.refresh_succeeded
+        report["auth_error"] = client.auth_failure
         report["stage"] = client.stage
         if client.last_http_error is not None:
             report["http_error"] = client.last_http_error

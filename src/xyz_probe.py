@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
-"""One-shot, standard-library-only Xiaoyuzhou feasibility probe.
+"""Bounded, standard-library-only Xiaoyuzhou read probe.
 
-No existing credentials, token files, refresh calls, audio downloads, history
-writes, redirects, environment proxies, or transcript text exports.
+Saved-session authentication is optional and managed by xyz_auth.
+No audio downloads, history writes, redirects, proxies or transcript exports.
 Sources (reviewed 2026-10-12; unofficial and not a contract):
 https://github.com/ultrazg/xyz/blob/main/handlers/history.go
 https://github.com/r266-tech/xiaoyuzhou/blob/main/xiaoyuzhou/client.py
@@ -14,7 +14,6 @@ import json
 import math
 import os
 import re
-import resource
 import socket
 import ssl
 import sys
@@ -48,6 +47,77 @@ PUBLIC_KEYS = {"eid", "title", "duration", "isPlayed", "isFinished", "transcript
 
 class Stop(Exception):
     """Only constant, non-sensitive codes may be used as messages."""
+
+
+def disable_core_dumps():
+    try:
+        import resource
+    except ImportError:
+        return  # Windows has no resource module; do not require a POSIX runtime.
+    try:
+        resource.setrlimit(resource.RLIMIT_CORE, (0, 0))
+    except (OSError, ValueError):
+        raise Stop("core_dump_protection_failed") from None
+
+
+def close_http_error(error):
+    # Cleanup must not replace the fixed error code, including broken 3.9 error streams.
+    try:
+        error.close()
+    except Exception:
+        pass
+
+
+def protect_path(path, directory=False):
+    """POSIX mode or a protected Windows DACL; fail before writing secrets."""
+    try:
+        if os.name != "nt":
+            os.chmod(path, 0o700 if directory else 0o600)
+            return
+        import csv
+        import ctypes
+        from ctypes import wintypes
+        import subprocess
+        identity = subprocess.check_output(["whoami", "/user", "/fo", "csv", "/nh"],
+                                           stderr=subprocess.DEVNULL, timeout=10)
+        sid = next(csv.reader(identity.decode("utf-8", errors="replace").splitlines()))[1]
+        if not re.fullmatch(r"S-[0-9]+(?:-[0-9]+)+", sid):
+            raise ValueError
+        api = ctypes.WinDLL("advapi32", use_last_error=True)
+        kernel = ctypes.WinDLL("kernel32", use_last_error=True)
+        convert = api.ConvertStringSecurityDescriptorToSecurityDescriptorW
+        convert.argtypes = [wintypes.LPCWSTR, wintypes.DWORD, ctypes.POINTER(ctypes.c_void_p), ctypes.c_void_p]
+        convert.restype = wintypes.BOOL
+        apply = api.SetFileSecurityW
+        apply.argtypes = [wintypes.LPCWSTR, wintypes.DWORD, ctypes.c_void_p]
+        apply.restype = wintypes.BOOL
+        kernel.LocalFree.argtypes = [ctypes.c_void_p]
+        kernel.LocalFree.restype = ctypes.c_void_p
+        descriptor = ctypes.c_void_p()
+        inheritance = "OICI" if directory else ""
+        sddl = f"D:P(A;{inheritance};FA;;;{sid})(A;{inheritance};FA;;;SY)"
+        if not convert(sddl, 1, ctypes.byref(descriptor), None):
+            raise OSError
+        try:
+            if not apply(str(path), 0x4 | 0x80000000, descriptor):
+                raise OSError
+        finally:
+            kernel.LocalFree(descriptor)
+    except Exception:
+        raise Stop("private_permissions_failed") from None
+
+
+def app_headers(access_token=None, device_id=None):
+    headers = {"Accept": "application/json", "Accept-Encoding": "identity",
+               "Content-Type": "application/json;charset=UTF-8",
+               "User-Agent": "Xiaoyuzhou/2.99.1(android 28)", "os": "android", "os-version": "28",
+               "applicationid": "app.podcast.cosmos", "app-version": "2.99.1", "app-buildno": "1362",
+               "timezone": "Asia/Shanghai", "local-time": datetime.now(CN).isoformat(timespec="milliseconds")}
+    if access_token:
+        headers["x-jike-access-token"] = access_token
+    if device_id:
+        headers["x-jike-device-id"] = device_id
+    return headers
 
 
 def normalize_area_code(value):
@@ -217,6 +287,11 @@ class Client:
         self.requests = 0
         self.stage = "not_started"
         self.last_http_error = None
+        self.saved_session = None
+        self.refresh_attempted = False
+        self.refresh_requests = 0
+        self.refresh_succeeded = False
+        self.auth_failure = None
         self.opener = urllib.request.build_opener(
             urllib.request.ProxyHandler({}), NoRedirect(),
             urllib.request.HTTPSHandler(context=ssl.create_default_context()))
@@ -224,6 +299,7 @@ class Client:
     def clear(self):
         self.token = None
         self.device_id = None
+        self.saved_session = None
 
     def request(self, method, url, payload=None, authenticated=False, login=False, cdn=False):
         parsed = urllib.parse.urlsplit(url)
@@ -238,6 +314,8 @@ class Client:
             raise Stop("endpoint_not_allowlisted")
         if authenticated and (not self.token or parsed.netloc != "api.xiaoyuzhoufm.com"):
             raise Stop("missing_auth_or_wrong_host")
+        if authenticated and self.auth_failure:
+            raise Stop(self.auth_failure)
         if self.requests >= 10:
             raise Stop("request_limit")
         delay = 2 - (time.monotonic() - self.last_request)
@@ -249,10 +327,7 @@ class Client:
         else:
             headers.update({"User-Agent": "Xiaoyuzhou/2.99.1(android 28)"})
         if authenticated:
-            headers.update({"x-jike-access-token": self.token, "x-jike-device-id": self.device_id,
-                            "os": "android", "os-version": "28", "applicationid": "app.podcast.cosmos",
-                            "app-version": "2.99.1", "app-buildno": "1362", "timezone": "Asia/Shanghai",
-                            "local-time": datetime.now(CN).isoformat(timespec="milliseconds")})
+            headers.update(app_headers(self.token, self.device_id))
         req = urllib.request.Request(url, data=json.dumps(payload).encode() if payload is not None else None, headers=headers, method=method)
         self.stage = {
             "/v1/auth/send-code": "send_sms",
@@ -290,7 +365,19 @@ class Client:
             except Exception:
                 self.last_http_error = {"http_status": status, "body_not_parsed": "read_error"}
             finally:
-                err.close()
+                close_http_error(err)
+            if status == 401 and authenticated and self.saved_session is not None:
+                if self.refresh_attempted:
+                    self.auth_failure = "session_relogin_required"
+                    self.saved_session.mark_rejected()
+                    raise Stop(self.auth_failure) from None
+                self.refresh_attempted = True
+                try:
+                    self.saved_session.refresh(self)
+                except Stop as exc:
+                    self.auth_failure = str(exc)
+                    raise
+                return self.request(method, url, payload, authenticated=True)
             raise Stop("http_" + str(status)) from None
         except (urllib.error.URLError, ssl.SSLError, TimeoutError, OSError):
             raise Stop("network_or_tls_error") from None
@@ -405,11 +492,14 @@ def run_probe(client, report):
 def save_report(report, name):
     reports = BASE / "reports"
     reports.mkdir(mode=0o700, exist_ok=True)
+    protect_path(reports, directory=True)
     directory = reports / datetime.now(CN).strftime("%Y-%m-%d")
     directory.mkdir(mode=0o700, exist_ok=True)
+    protect_path(directory, directory=True)
     path = directory / name
     fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
     with os.fdopen(fd, "w", encoding="utf-8") as handle:
+        protect_path(path)
         json.dump(report, handle, ensure_ascii=False, indent=2, allow_nan=False)
         handle.write("\n")
     return path
@@ -429,7 +519,7 @@ def preflight():
 
 
 def main():
-    resource.setrlimit(resource.RLIMIT_CORE, (0, 0))
+    disable_core_dumps()
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--login-and-probe", action="store_true", help="Currently paused: official login requires browser verification. No SMS is sent.")
     parser.add_argument("--preflight", action="store_true", help="Verified TLS handshakes only; no phone, SMS, tokens or HTTP calls.")

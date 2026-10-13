@@ -19,7 +19,8 @@ class QrSafetyTests(unittest.TestCase):
             path = Path(tmp) / "login.png"
             q.render_qr("https://h5.xiaoyuzhoufm.com/oauth?id=fixture", path)
             self.assertEqual(path.read_bytes()[:8], b"\x89PNG\r\n\x1a\n")
-            self.assertEqual(os.stat(path).st_mode & 0o777, 0o600)
+            if os.name != "nt":
+                self.assertEqual(os.stat(path).st_mode & 0o777, 0o600)
             width, height, rows, metadata = png.Reader(bytes=path.read_bytes()).read()
             pixels = list(rows)
             self.assertEqual(width, height)
